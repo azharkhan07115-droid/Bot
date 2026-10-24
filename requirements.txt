@@ -2,4 +2,5 @@ flask
 python-telegram-bot==20.7
 requests
 urllib3
-seleniumbase
+undetected-chromedriver
+selenium
