@@ -13,6 +13,7 @@ import time
 import random
 import string
 import shutil
+import subprocess
 import requests
 import threading
 import urllib3
@@ -22,7 +23,6 @@ from flask import Flask, jsonify
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ── CONFIG ────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID   = int(os.environ.get("CHAT_ID", "0"))
 PORT      = int(os.environ.get("PORT", "8080"))
@@ -35,16 +35,11 @@ state = {
     "mail_obj":    None,
 }
 
-# ── FLASK HEALTH ──────────────────────────────────────────────────────
 flask_app = Flask(__name__)
 
 @flask_app.route("/health")
 def health():
-    return jsonify({
-        "status":   "ok",
-        "accounts": len(state["accounts"]),
-        "running":  state["running"],
-    })
+    return jsonify({"status": "ok", "accounts": len(state["accounts"]), "running": state["running"]})
 
 @flask_app.route("/")
 def index():
@@ -53,14 +48,12 @@ def index():
 def run_flask():
     flask_app.run(host="0.0.0.0", port=PORT, use_reloader=False)
 
-# ── SAFE TELEGRAM SEND ────────────────────────────────────────────────
 async def safe_send(bot, text):
     try:
         await bot.send_message(chat_id=CHAT_ID, text=text)
     except Exception:
         pass
 
-# ── GUERRILLAMAIL TEMP MAIL ───────────────────────────────────────────
 class TempMail:
     BASE = "https://api.guerrillamail.com/ajax.php"
 
@@ -71,8 +64,8 @@ class TempMail:
         self.s.headers["User-Agent"] = "Mozilla/5.0"
 
     def generate(self):
-        r   = self.s.get(self.BASE, params={"f": "get_email_address"}, timeout=15)
-        d   = r.json()
+        r = self.s.get(self.BASE, params={"f": "get_email_address"}, timeout=15)
+        d = r.json()
         self.sid = d["sid_token"]
         return d["email_addr"].replace("\\@", "@")
 
@@ -81,20 +74,12 @@ class TempMail:
         end  = time.time() + timeout
         while time.time() < end:
             try:
-                r = self.s.get(
-                    self.BASE,
-                    params={"f": "get_email_list", "offset": 0, "sid_token": self.sid},
-                    timeout=10
-                )
+                r = self.s.get(self.BASE, params={"f": "get_email_list", "offset": 0, "sid_token": self.sid}, timeout=10)
                 for msg in r.json().get("list", []):
                     mid = msg.get("mail_id")
                     if mid and mid not in seen:
                         seen.add(mid)
-                        full = self.s.get(
-                            self.BASE,
-                            params={"f": "fetch_email", "email_id": mid, "sid_token": self.sid},
-                            timeout=10
-                        ).json()
+                        full = self.s.get(self.BASE, params={"f": "fetch_email", "email_id": mid, "sid_token": self.sid}, timeout=10).json()
                         body = full.get("mail_body", "") + full.get("mail_text", "")
                         m = re.search(r'\b(\d{6,8})\b', body)
                         if m:
@@ -104,7 +89,6 @@ class TempMail:
             time.sleep(4)
         return None
 
-# ── PROXY ─────────────────────────────────────────────────────────────
 def fetch_proxies():
     urls = [
         "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
@@ -127,18 +111,13 @@ def get_proxy():
     random.shuffle(state["proxy_list"])
     for p in state["proxy_list"][:50]:
         try:
-            r = requests.get(
-                "http://httpbin.org/ip",
-                proxies={"http": f"http://{p}", "https": f"http://{p}"},
-                timeout=6, verify=False
-            )
+            r = requests.get("http://httpbin.org/ip", proxies={"http": f"http://{p}", "https": f"http://{p}"}, timeout=6, verify=False)
             if r.status_code == 200:
                 return p
         except:
             pass
     return None
 
-# ── HELPERS ───────────────────────────────────────────────────────────
 def rand_pass():
     return ''.join(random.choices(string.ascii_letters + string.digits, k=12)) + "!9"
 
@@ -147,43 +126,75 @@ def rand_user():
     n = ["wolf","fox","hawk","viper","blade","byte","ninja","storm"]
     return f"{random.choice(a)}{random.choice(n)}{random.randint(100,9999)}"
 
-# ── SELENIUM DRIVER FACTORY ───────────────────────────────────────────
+def _get_chromium_version():
+    """Chromium ka major version nikalo — uc ko dena hai."""
+    for cmd in ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"]:
+        path = shutil.which(cmd) or f"/usr/bin/{cmd}"
+        try:
+            out = subprocess.check_output([path, "--version"], stderr=subprocess.DEVNULL).decode()
+            # "Chromium 120.0.6099.109 ..." → 120
+            m = re.search(r'(\d+)\.\d+\.\d+', out)
+            if m:
+                return int(m.group(1))
+        except:
+            pass
+    return None
+
 def _make_driver(proxy=None):
     import undetected_chromedriver as uc
+
+    # Chromium binary path
+    binary = (
+        shutil.which("chromium")
+        or shutil.which("chromium-browser")
+        or shutil.which("google-chrome")
+        or "/usr/bin/chromium"
+        or "/usr/bin/chromium-browser"
+    )
+
+    # Chromedriver path — apt se installed
+    chromedriver = (
+        shutil.which("chromedriver")
+        or "/usr/bin/chromedriver"
+        or "/usr/lib/chromium/chromedriver"
+        or "/usr/lib/chromium-browser/chromedriver"
+    )
+
+    version = _get_chromium_version()
+
     opts = uc.ChromeOptions()
     opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-setuid-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-software-rasterizer")
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("--headless=new")
     opts.add_argument("--window-size=1280,720")
     opts.add_argument("--single-process")
     opts.add_argument("--disable-extensions")
-    opts.add_argument("--disable-software-rasterizer")
+    opts.add_argument("--memory-pressure-off")
+    opts.add_argument("--max_old_space_size=512")
+
+    if binary and os.path.exists(binary):
+        opts.binary_location = binary
+
     if proxy:
         opts.add_argument(f"--proxy-server=http://{proxy}")
 
-    binary = (
-        shutil.which("chromium")
-        or shutil.which("chromium-browser")
-        or shutil.which("google-chrome")
-        or shutil.which("google-chrome-stable")
-        or "/usr/bin/chromium"
-        or "/usr/bin/chromium-browser"
-    )
-    if binary:
-        opts.binary_location = binary
+    kwargs = {"options": opts, "use_subprocess": True}
+    if chromedriver and os.path.exists(chromedriver):
+        kwargs["driver_executable_path"] = chromedriver
+    if version:
+        kwargs["version_main"] = version
 
-    return uc.Chrome(options=opts)
+    return uc.Chrome(**kwargs)
 
 def _wait_element(driver, by, selector, timeout=15):
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
-    return WebDriverWait(driver, timeout).until(
-        EC.presence_of_element_located((by, selector))
-    )
+    return WebDriverWait(driver, timeout).until(EC.presence_of_element_located((by, selector)))
 
-# ── GITHUB ACCOUNT ────────────────────────────────────────────────────
 def _github_sync(email, username, password, mail_obj, notify_q):
     from selenium.webdriver.common.by import By
     from selenium.webdriver.common.keys import Keys
@@ -246,13 +257,8 @@ def _github_sync(email, username, password, mail_obj, notify_q):
         if otp:
             notify_q.append(f"OTP: {otp}")
             try:
-                inp = driver.find_element(
-                    By.CSS_SELECTOR,
-                    "input[name='otp'], input[autocomplete='one-time-code']"
-                )
-                inp.clear()
-                inp.send_keys(str(otp))
-                inp.send_keys(Keys.RETURN)
+                inp = driver.find_element(By.CSS_SELECTOR, "input[name='otp'], input[autocomplete='one-time-code']")
+                inp.clear(); inp.send_keys(str(otp)); inp.send_keys(Keys.RETURN)
                 time.sleep(3)
             except:
                 pass
@@ -266,7 +272,7 @@ def _github_sync(email, username, password, mail_obj, notify_q):
             return False
 
     except Exception as e:
-        notify_q.append(f"GitHub error: {str(e)[:150]}")
+        notify_q.append(f"GitHub error: {str(e)[:200]}")
         return False
     finally:
         try: driver.quit()
@@ -275,16 +281,13 @@ def _github_sync(email, username, password, mail_obj, notify_q):
 async def create_github(email, username, password, bot, mail_obj):
     notify_q = []
     loop     = asyncio.get_event_loop()
-    future   = loop.run_in_executor(
-        None, lambda: _github_sync(email, username, password, mail_obj, notify_q)
-    )
+    future   = loop.run_in_executor(None, lambda: _github_sync(email, username, password, mail_obj, notify_q))
     while not future.done():
         await asyncio.sleep(2)
         while notify_q: await safe_send(bot, notify_q.pop(0))
     while notify_q: await safe_send(bot, notify_q.pop(0))
     return future.result()
 
-# ── RENDER VIA GITHUB OAUTH ───────────────────────────────────────────
 def _render_sync(gh_email, gh_pass, notify_q):
     from selenium.webdriver.common.by import By
     from selenium.webdriver.common.keys import Keys
@@ -303,8 +306,7 @@ def _render_sync(gh_email, gh_pass, notify_q):
         if not gh_btn:
             notify_q.append("Render: GitHub button nahi mila.")
             return None
-        gh_btn.click()
-        time.sleep(3)
+        gh_btn.click(); time.sleep(3)
 
         if "github.com" in driver.current_url:
             notify_q.append("GitHub login kar raha hu...")
@@ -332,15 +334,13 @@ def _render_sync(gh_email, gh_pass, notify_q):
             notify_q.append("Render account bana! API key le raha hu...")
             driver.get("https://dashboard.render.com/account/api-keys")
             time.sleep(2)
-
             try:
                 for btn in driver.find_elements(By.TAG_NAME, "button"):
                     if "create api key" in btn.text.lower() or "new api key" in btn.text.lower():
                         btn.click(); time.sleep(1); break
                 inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='text']")
                 if inputs:
-                    inputs[0].clear()
-                    inputs[0].send_keys("bot-key")
+                    inputs[0].clear(); inputs[0].send_keys("bot-key")
                 for btn in driver.find_elements(By.TAG_NAME, "button"):
                     if btn.get_attribute("type") == "submit" or "create" in btn.text.lower():
                         btn.click(); time.sleep(2); break
@@ -366,16 +366,13 @@ def _render_sync(gh_email, gh_pass, notify_q):
 async def create_render(gh_email, gh_pass, bot):
     notify_q = []
     loop     = asyncio.get_event_loop()
-    future   = loop.run_in_executor(
-        None, lambda: _render_sync(gh_email, gh_pass, notify_q)
-    )
+    future   = loop.run_in_executor(None, lambda: _render_sync(gh_email, gh_pass, notify_q))
     while not future.done():
         await asyncio.sleep(2)
         while notify_q: await safe_send(bot, notify_q.pop(0))
     while notify_q: await safe_send(bot, notify_q.pop(0))
     return future.result()
 
-# ── FULL AUTO ─────────────────────────────────────────────────────────
 async def full_auto(bot):
     mail     = TempMail()
     username = rand_user()
@@ -389,16 +386,11 @@ async def full_auto(bot):
         await safe_send(bot, f"Temp mail fail: {str(e)[:200]}")
         return
 
-    await safe_send(bot,
-        f"Email: {email}\nUsername: {username}\nPassword: {password}"
-    )
-
+    await safe_send(bot, f"Email: {email}\nUsername: {username}\nPassword: {password}")
     await safe_send(bot, "--- Step 1: GitHub ---")
     ok = await create_github(email, username, password, bot, mail)
     if not ok:
-        await safe_send(bot,
-            "GitHub fail.\nCaptcha ya IP issue.\n/auto se dobara try karo."
-        )
+        await safe_send(bot, "GitHub fail.\nCaptcha ya IP issue.\n/auto se dobara try karo.")
         return
 
     await asyncio.sleep(5)
@@ -406,20 +398,10 @@ async def full_auto(bot):
     await safe_send(bot, "--- Step 2: Render ---")
     rkey = await create_render(email, password, bot)
     if not rkey:
-        await safe_send(bot,
-            f"Render API key nahi mila.\n"
-            f"GitHub bana:\nEmail: {email}\nPass: {password}\n"
-            f"Manually render.com pe GitHub se signup karo."
-        )
+        await safe_send(bot, f"Render API key nahi mila.\nEmail: {email}\nPass: {password}")
         return
 
-    acc = {
-        "num":      len(state["accounts"]) + 1,
-        "email":    email,
-        "username": username,
-        "password": password,
-        "render_api_key": rkey,
-    }
+    acc = {"num": len(state["accounts"]) + 1, "email": email, "username": username, "password": password, "render_api_key": rkey}
     state["accounts"].append(acc)
     try:
         with open("accounts.json", "w") as f:
@@ -427,30 +409,16 @@ async def full_auto(bot):
     except:
         pass
 
-    await safe_send(bot,
-        f"✅ Account #{acc['num']} READY!\n\n"
-        f"Email: {email}\n"
-        f"GitHub: {username}\n"
-        f"Password: {password}\n"
-        f"Render API Key: {rkey}"
-    )
+    await safe_send(bot, f"✅ Account #{acc['num']} READY!\n\nEmail: {email}\nGitHub: {username}\nPassword: {password}\nRender API Key: {rkey}")
 
-# ── COMMANDS ──────────────────────────────────────────────────────────
 async def cmd_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if u.effective_chat.id != CHAT_ID: return
-    await u.message.reply_text(
-        "Auto Account Bot\n\n"
-        "/auto   - full auto (mail→github→render→key)\n"
-        "/otp CODE - manual OTP\n"
-        "/status - accounts list\n"
-        "/proxies - fresh proxies load"
-    )
+    await u.message.reply_text("Auto Account Bot\n\n/auto - full auto\n/otp CODE - manual OTP\n/status - accounts\n/proxies - load proxies")
 
 async def cmd_auto(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if u.effective_chat.id != CHAT_ID: return
     if state["running"]:
-        await u.message.reply_text("Pehla chal raha hai...")
-        return
+        await u.message.reply_text("Pehla chal raha hai..."); return
     state["running"] = True
     await u.message.reply_text("Full auto shuru!")
     bot = ctx.bot
@@ -462,8 +430,7 @@ async def cmd_auto(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_otp(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if u.effective_chat.id != CHAT_ID: return
     if not ctx.args:
-        await u.message.reply_text("Usage: /otp CODE")
-        return
+        await u.message.reply_text("Usage: /otp CODE"); return
     state["pending_otp"] = ctx.args[0]
     await u.message.reply_text(f"OTP set: {ctx.args[0]}")
 
@@ -474,15 +441,10 @@ async def cmd_status(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             with open("accounts.json") as f: state["accounts"] = json.load(f)
         except: pass
     if not state["accounts"]:
-        await u.message.reply_text("Koi account nahi. /auto se banao.")
-        return
-    msg = f"Total accounts: {len(state['accounts'])}\n\n"
+        await u.message.reply_text("Koi account nahi. /auto se banao."); return
+    msg = f"Total: {len(state['accounts'])}\n\n"
     for a in state["accounts"]:
-        msg += (
-            f"#{a['num']} {a.get('username','?')}\n"
-            f"  Email: {a.get('email','?')}\n"
-            f"  Key: {a.get('render_api_key','?')[:20]}...\n\n"
-        )
+        msg += f"#{a['num']} {a.get('username','?')}\n  Key: {a.get('render_api_key','?')[:20]}...\n\n"
     await u.message.reply_text(msg)
 
 async def cmd_proxies(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -491,12 +453,10 @@ async def cmd_proxies(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     count = await asyncio.get_event_loop().run_in_executor(None, fetch_proxies)
     await u.message.reply_text(f"{count} proxies ready!")
 
-# ── MAIN ──────────────────────────────────────────────────────────────
 def main():
     print(f"[*] Flask port {PORT}...")
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=fetch_proxies, daemon=True).start()
-
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("auto",    cmd_auto))
