@@ -3,6 +3,7 @@
 Auto Account Creator Bot
 Temp mail (GuerillaMail) -> GitHub -> Render OAuth -> API key -> Telegram
 Flask /health keeps Render alive.
+Uses SeleniumBase UC Mode for better bot detection bypass.
 """
 
 import asyncio
@@ -12,8 +13,6 @@ import re
 import time
 import random
 import string
-import shutil
-import subprocess
 import requests
 import threading
 import urllib3
@@ -23,9 +22,10 @@ from flask import Flask, jsonify
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-CHAT_ID   = int(os.environ.get("CHAT_ID", "0"))
-PORT      = int(os.environ.get("PORT", "8080"))
+BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
+CHAT_ID        = int(os.environ.get("CHAT_ID", "0"))
+PORT           = int(os.environ.get("PORT", "8080"))
+CAPTCHA_KEY    = os.environ.get("CAPTCHA_KEY", "")   # 2captcha API key (optional)
 
 state = {
     "accounts":    [],
@@ -48,12 +48,22 @@ def index():
 def run_flask():
     flask_app.run(host="0.0.0.0", port=PORT, use_reloader=False)
 
+# ─── keep-alive: ping /health every 10 min so Render doesn't sleep ───────────
+def _keepalive():
+    while True:
+        try:
+            requests.get(f"http://localhost:{PORT}/health", timeout=5)
+        except:
+            pass
+        time.sleep(600)
+
 async def safe_send(bot, text):
     try:
         await bot.send_message(chat_id=CHAT_ID, text=text)
     except Exception:
         pass
 
+# ─── Temp Mail ────────────────────────────────────────────────────────────────
 class TempMail:
     BASE = "https://api.guerrillamail.com/ajax.php"
 
@@ -74,12 +84,20 @@ class TempMail:
         end  = time.time() + timeout
         while time.time() < end:
             try:
-                r = self.s.get(self.BASE, params={"f": "get_email_list", "offset": 0, "sid_token": self.sid}, timeout=10)
+                r = self.s.get(
+                    self.BASE,
+                    params={"f": "get_email_list", "offset": 0, "sid_token": self.sid},
+                    timeout=10
+                )
                 for msg in r.json().get("list", []):
                     mid = msg.get("mail_id")
                     if mid and mid not in seen:
                         seen.add(mid)
-                        full = self.s.get(self.BASE, params={"f": "fetch_email", "email_id": mid, "sid_token": self.sid}, timeout=10).json()
+                        full = self.s.get(
+                            self.BASE,
+                            params={"f": "fetch_email", "email_id": mid, "sid_token": self.sid},
+                            timeout=10
+                        ).json()
                         body = full.get("mail_body", "") + full.get("mail_text", "")
                         m = re.search(r'\b(\d{6,8})\b', body)
                         if m:
@@ -89,10 +107,12 @@ class TempMail:
             time.sleep(4)
         return None
 
+# ─── Proxy management ─────────────────────────────────────────────────────────
 def fetch_proxies():
     urls = [
         "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
         "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+        "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
     ]
     proxies = []
     for u in urls:
@@ -109,138 +129,241 @@ def get_proxy():
     if not state["proxy_list"]:
         fetch_proxies()
     random.shuffle(state["proxy_list"])
-    for p in state["proxy_list"][:50]:
+    # Test against GitHub specifically
+    for p in state["proxy_list"][:100]:
         try:
-            r = requests.get("http://httpbin.org/ip", proxies={"http": f"http://{p}", "https": f"http://{p}"}, timeout=6, verify=False)
-            if r.status_code == 200:
+            r = requests.get(
+                "https://github.com",
+                proxies={"http": f"http://{p}", "https": f"http://{p}"},
+                timeout=8,
+                verify=False,
+                allow_redirects=True
+            )
+            if r.status_code in (200, 301, 302):
                 return p
         except:
             pass
     return None
 
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 def rand_pass():
     return ''.join(random.choices(string.ascii_letters + string.digits, k=12)) + "!9"
 
 def rand_user():
-    a = ["dark","swift","ghost","iron","quick","cyber","brave","steel"]
-    n = ["wolf","fox","hawk","viper","blade","byte","ninja","storm"]
-    return f"{random.choice(a)}{random.choice(n)}{random.randint(100,9999)}"
+    a = ["dark","swift","ghost","iron","quick","cyber","brave","steel","night","sonic","alpha","delta"]
+    n = ["wolf","fox","hawk","viper","blade","byte","ninja","storm","pixel","core","node","grid"]
+    return f"{random.choice(a)}{random.choice(n)}{random.randint(1000,9999)}"
 
-def _get_chromium_version():
-    """Chromium ka major version nikalo — uc ko dena hai."""
-    for cmd in ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"]:
-        path = shutil.which(cmd) or f"/usr/bin/{cmd}"
-        try:
-            out = subprocess.check_output([path, "--version"], stderr=subprocess.DEVNULL).decode()
-            # "Chromium 120.0.6099.109 ..." → 120
-            m = re.search(r'(\d+)\.\d+\.\d+', out)
-            if m:
-                return int(m.group(1))
-        except:
-            pass
+def _human_type(sb, selector, text):
+    """Type with human-like random delays using SeleniumBase."""
+    try:
+        sb.click(selector)
+    except:
+        pass
+    for ch in text:
+        sb.execute_script(
+            f"arguments[0].value += arguments[1]",
+            sb.find_element(selector), ch
+        )
+        time.sleep(random.uniform(0.05, 0.15))
+    # Also use native type to ensure JS events fire
+    try:
+        sb.type(selector, text)
+    except:
+        pass
+
+# ─── 2captcha solver (optional) ──────────────────────────────────────────────
+def _solve_funcaptcha(site_key, page_url):
+    """Submit Arkose/FunCaptcha to 2captcha. Returns token or None."""
+    if not CAPTCHA_KEY:
+        return None
+    try:
+        r = requests.post(
+            "http://2captcha.com/in.php",
+            data={
+                "key": CAPTCHA_KEY,
+                "method": "funcaptcha",
+                "publickey": site_key,
+                "pageurl": page_url,
+                "json": 1,
+            },
+            timeout=15,
+        )
+        req_id = r.json().get("request")
+        if not req_id:
+            return None
+        for _ in range(24):   # wait up to 2 min
+            time.sleep(5)
+            res = requests.get(
+                f"http://2captcha.com/res.php?key={CAPTCHA_KEY}&action=get&id={req_id}&json=1",
+                timeout=10,
+            ).json()
+            if res.get("status") == 1:
+                return res["request"]
+            if res.get("request") == "ERROR_CAPTCHA_UNSOLVABLE":
+                return None
+    except:
+        pass
     return None
 
-def _make_driver(proxy=None):
-    import undetected_chromedriver as uc
+# ─── SeleniumBase driver factory ──────────────────────────────────────────────
+def _make_sb_driver(proxy=None):
+    """
+    Returns a SeleniumBase SB context-managed driver in UC mode.
+    Caller must use as context manager or call .tearDown() manually.
+    """
+    from seleniumbase import Driver
 
-    # Chromium binary path
-    binary = (
-        shutil.which("chromium")
-        or shutil.which("chromium-browser")
-        or shutil.which("google-chrome")
-        or "/usr/bin/chromium"
-        or "/usr/bin/chromium-browser"
-    )
-
-    # Chromedriver path — apt se installed
-    chromedriver = (
-        shutil.which("chromedriver")
-        or "/usr/bin/chromedriver"
-        or "/usr/lib/chromium/chromedriver"
-        or "/usr/lib/chromium-browser/chromedriver"
-    )
-
-    version = _get_chromium_version()
-
-    opts = uc.ChromeOptions()
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-setuid-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--disable-software-rasterizer")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument("--headless=new")
-    opts.add_argument("--window-size=1280,720")
-    opts.add_argument("--single-process")
-    opts.add_argument("--disable-extensions")
-    opts.add_argument("--memory-pressure-off")
-    opts.add_argument("--max_old_space_size=512")
-
-    if binary and os.path.exists(binary):
-        opts.binary_location = binary
-
+    kwargs = {
+        "uc": True,
+        "headless": False,   # headless detectable — use Xvfb instead
+        "no_sandbox": True,
+        "disable_gpu": True,
+    }
     if proxy:
-        opts.add_argument(f"--proxy-server=http://{proxy}")
+        kwargs["proxy"] = proxy
 
-    kwargs = {"options": opts, "use_subprocess": True}
-    if chromedriver and os.path.exists(chromedriver):
-        kwargs["driver_executable_path"] = chromedriver
-    if version:
-        kwargs["version_main"] = version
+    driver = Driver(**kwargs)
 
-    return uc.Chrome(**kwargs)
+    # navigator.webdriver spoofing via CDP
+    try:
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                window.chrome = {runtime: {}};
+                Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+            """
+        })
+    except:
+        pass
 
-def _wait_element(driver, by, selector, timeout=15):
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    return WebDriverWait(driver, timeout).until(EC.presence_of_element_located((by, selector)))
+    return driver
 
+# ─── GitHub signup ────────────────────────────────────────────────────────────
 def _github_sync(email, username, password, mail_obj, notify_q):
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.common.keys import Keys
-    from selenium.webdriver.common.action_chains import ActionChains
-
     proxy = get_proxy()
     if proxy:
         notify_q.append(f"Proxy: {proxy}")
+    else:
+        notify_q.append("Proxy nahi mila, direct try kar raha hu...")
 
-    driver = _make_driver(proxy)
+    driver = _make_sb_driver(proxy)
     try:
         notify_q.append("GitHub signup open...")
-        driver.get("https://github.com/signup")
-        time.sleep(2)
 
-        el = _wait_element(driver, By.ID, "email")
-        el.clear(); el.send_keys(email); time.sleep(0.5)
-        el.send_keys(Keys.RETURN); time.sleep(1)
+        # UC Mode reconnect — avoids initial detection window
+        driver.uc_open_with_reconnect("https://github.com/signup", 4)
+        time.sleep(random.uniform(2, 3))
 
-        el = _wait_element(driver, By.ID, "password")
-        el.send_keys(password); time.sleep(0.5)
-        el.send_keys(Keys.RETURN); time.sleep(1)
-
-        el = _wait_element(driver, By.ID, "login")
-        el.send_keys(username); time.sleep(1)
-        el.send_keys(Keys.RETURN); time.sleep(1)
-
+        # ── Email ──
         try:
-            for lbl in driver.find_elements(By.TAG_NAME, "label"):
-                if lbl.text.strip().lower().startswith("n"):
-                    lbl.click(); break
+            for sel in ["#email", "input[name='user[email]']", "input[type='email']"]:
+                try:
+                    driver.type(sel, email)
+                    break
+                except:
+                    continue
+            time.sleep(random.uniform(0.5, 1.2))
+            driver.send_keys("input:focus", "\n")
+            time.sleep(random.uniform(1.5, 2.5))
+        except Exception as e:
+            notify_q.append(f"Email field error: {str(e)[:80]}")
+            return False
+
+        # ── Password ──
+        try:
+            for sel in ["#password", "input[name='user[password]']", "input[type='password']"]:
+                try:
+                    driver.type(sel, password)
+                    break
+                except:
+                    continue
+            time.sleep(random.uniform(0.5, 1.2))
+            driver.send_keys("input:focus", "\n")
+            time.sleep(random.uniform(1.5, 2.5))
+        except Exception as e:
+            notify_q.append(f"Password field error: {str(e)[:80]}")
+            return False
+
+        # ── Username ──
+        try:
+            for sel in ["#login", "input[name='user[login]']", "input[autocomplete='username']"]:
+                try:
+                    driver.type(sel, username)
+                    break
+                except:
+                    continue
+            time.sleep(random.uniform(1.0, 2.0))
+            driver.send_keys("input:focus", "\n")
+            time.sleep(random.uniform(1.5, 2.5))
+        except Exception as e:
+            notify_q.append(f"Username field error: {str(e)[:80]}")
+            return False
+
+        # ── Email preferences (No) ──
+        try:
+            driver.find_element("label", by="tag").click()
         except:
             pass
-        ActionChains(driver).send_keys(Keys.RETURN).perform()
-        time.sleep(1)
+        time.sleep(random.uniform(0.5, 1.0))
 
-        notify_q.append("Captcha wait 10s...")
-        time.sleep(10)
-
+        # ── Continue/Submit ──
         try:
-            for btn in driver.find_elements(By.TAG_NAME, "button"):
-                if "create account" in btn.text.lower():
-                    btn.click(); time.sleep(3); break
+            for txt in ["Continue", "Create account", "Sign up"]:
+                try:
+                    driver.click(f"button:contains('{txt}')")
+                    break
+                except:
+                    continue
+        except:
+            pass
+        time.sleep(random.uniform(2, 3))
+
+        # ── Captcha handling ──
+        notify_q.append("Captcha check kar raha hu...")
+
+        # Try 2captcha if key available
+        captcha_solved = False
+        if CAPTCHA_KEY:
+            try:
+                # Find Arkose iframe sitekey
+                src = driver.get_page_source()
+                m = re.search(r'data-pkey="([^"]+)"', src)
+                if not m:
+                    m = re.search(r'"sitekey"\s*:\s*"([^"]+)"', src)
+                if m:
+                    site_key = m.group(1)
+                    notify_q.append("Captcha solve kar raha hu (2captcha)...")
+                    token = _solve_funcaptcha(site_key, "https://github.com/signup")
+                    if token:
+                        driver.execute_script(
+                            f"document.querySelector('input[name=\"fc-token\"]') && "
+                            f"(document.querySelector('input[name=\"fc-token\"]').value = '{token}');"
+                        )
+                        captcha_solved = True
+                        notify_q.append("Captcha token inject kiya.")
+            except:
+                pass
+
+        if not captcha_solved:
+            notify_q.append("Manual captcha solve hoga ya skip... 20s wait")
+            time.sleep(20)
+
+        # Try final submit again
+        try:
+            for txt in ["Create account", "Continue", "Submit"]:
+                try:
+                    driver.click(f"button:contains('{txt}')")
+                    time.sleep(2)
+                    break
+                except:
+                    continue
         except:
             pass
 
+        # ── OTP ──
         notify_q.append("OTP wait kar raha hu email mein...")
         otp = mail_obj.wait_for_otp(120)
 
@@ -257,99 +380,145 @@ def _github_sync(email, username, password, mail_obj, notify_q):
         if otp:
             notify_q.append(f"OTP: {otp}")
             try:
-                inp = driver.find_element(By.CSS_SELECTOR, "input[name='otp'], input[autocomplete='one-time-code']")
-                inp.clear(); inp.send_keys(str(otp)); inp.send_keys(Keys.RETURN)
+                for sel in [
+                    "input[name='otp']",
+                    "input[autocomplete='one-time-code']",
+                    "input[inputmode='numeric']",
+                    "input[type='text']",
+                ]:
+                    try:
+                        driver.type(sel, str(otp))
+                        driver.send_keys(sel, "\n")
+                        break
+                    except:
+                        continue
                 time.sleep(3)
             except:
                 pass
 
-        final = driver.current_url
-        if "github.com" in final and "signup" not in final:
+        final = driver.get_current_url()
+        notify_q.append(f"Final URL: {final[:100]}")
+
+        if "github.com" in final and "signup" not in final and "verify" not in final:
             notify_q.append(f"GitHub account bana: {username}")
             return True
         else:
-            notify_q.append(f"GitHub unclear. URL: {final[:80]}")
+            notify_q.append("GitHub signup unclear. URL check karo.")
             return False
 
     except Exception as e:
         notify_q.append(f"GitHub error: {str(e)[:200]}")
         return False
     finally:
-        try: driver.quit()
-        except: pass
+        try:
+            driver.quit()
+        except:
+            pass
 
 async def create_github(email, username, password, bot, mail_obj):
     notify_q = []
     loop     = asyncio.get_event_loop()
-    future   = loop.run_in_executor(None, lambda: _github_sync(email, username, password, mail_obj, notify_q))
+    future   = loop.run_in_executor(
+        None, lambda: _github_sync(email, username, password, mail_obj, notify_q)
+    )
     while not future.done():
         await asyncio.sleep(2)
-        while notify_q: await safe_send(bot, notify_q.pop(0))
-    while notify_q: await safe_send(bot, notify_q.pop(0))
+        while notify_q:
+            await safe_send(bot, notify_q.pop(0))
+    while notify_q:
+        await safe_send(bot, notify_q.pop(0))
     return future.result()
 
+# ─── Render signup ────────────────────────────────────────────────────────────
 def _render_sync(gh_email, gh_pass, notify_q):
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.common.keys import Keys
-
     proxy  = get_proxy()
-    driver = _make_driver(proxy)
+    driver = _make_sb_driver(proxy)
     try:
         notify_q.append("Render register open...")
-        driver.get("https://dashboard.render.com/register")
+        driver.uc_open_with_reconnect("https://dashboard.render.com/register", 4)
         time.sleep(3)
 
-        gh_btn = None
-        for el in driver.find_elements(By.TAG_NAME, "a") + driver.find_elements(By.TAG_NAME, "button"):
-            if "github" in el.text.lower():
-                gh_btn = el; break
-        if not gh_btn:
+        # Click GitHub OAuth button
+        try:
+            for txt in ["GitHub", "Continue with GitHub", "Sign in with GitHub"]:
+                try:
+                    driver.click(f"a:contains('{txt}')")
+                    time.sleep(3)
+                    break
+                except:
+                    try:
+                        driver.click(f"button:contains('{txt}')")
+                        time.sleep(3)
+                        break
+                    except:
+                        continue
+        except:
             notify_q.append("Render: GitHub button nahi mila.")
             return None
-        gh_btn.click(); time.sleep(3)
 
-        if "github.com" in driver.current_url:
+        # GitHub OAuth login
+        if "github.com" in driver.get_current_url():
             notify_q.append("GitHub login kar raha hu...")
             try:
-                _wait_element(driver, By.ID, "login").send_keys(gh_email)
-                driver.find_element(By.ID, "password").send_keys(gh_pass)
-                driver.find_element(By.CSS_SELECTOR, "input[type='submit']").click()
+                driver.type("#login_field", gh_email)
+                driver.type("#password", gh_pass)
+                driver.click("input[type='submit']")
                 time.sleep(3)
             except Exception as e:
                 notify_q.append(f"GitHub login error: {str(e)[:100]}")
 
-        if "oauth" in driver.current_url or "authorize" in driver.current_url:
+        # Authorize Render
+        cur = driver.get_current_url()
+        if "oauth" in cur or "authorize" in cur:
             try:
-                for btn in driver.find_elements(By.TAG_NAME, "button"):
-                    if "authorize" in btn.text.lower():
-                        btn.click(); time.sleep(3); break
-                for inp in driver.find_elements(By.CSS_SELECTOR, "input[type='submit']"):
-                    if "authorize" in (inp.get_attribute("value") or "").lower():
-                        inp.click(); time.sleep(3); break
+                driver.click("button:contains('Authorize')")
+                time.sleep(3)
             except:
-                pass
+                try:
+                    driver.click("input[value*='Authorize']")
+                    time.sleep(3)
+                except:
+                    pass
 
         time.sleep(2)
-        if "dashboard.render.com" in driver.current_url and "login" not in driver.current_url:
+        cur = driver.get_current_url()
+        if "dashboard.render.com" in cur and "login" not in cur:
             notify_q.append("Render account bana! API key le raha hu...")
-            driver.get("https://dashboard.render.com/account/api-keys")
+            driver.open("https://dashboard.render.com/account/api-keys")
             time.sleep(2)
             try:
-                for btn in driver.find_elements(By.TAG_NAME, "button"):
-                    if "create api key" in btn.text.lower() or "new api key" in btn.text.lower():
-                        btn.click(); time.sleep(1); break
-                inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='text']")
-                if inputs:
-                    inputs[0].clear(); inputs[0].send_keys("bot-key")
-                for btn in driver.find_elements(By.TAG_NAME, "button"):
-                    if btn.get_attribute("type") == "submit" or "create" in btn.text.lower():
-                        btn.click(); time.sleep(2); break
-                for sel in ["code", "input[readonly]"]:
-                    els = driver.find_elements(By.CSS_SELECTOR, sel)
-                    if els:
-                        k = els[0].text.strip() or els[0].get_attribute("value") or ""
+                for txt in ["Create API Key", "New API Key", "Add API Key"]:
+                    try:
+                        driver.click(f"button:contains('{txt}')")
+                        time.sleep(1)
+                        break
+                    except:
+                        continue
+                try:
+                    driver.type("input[type='text']", "bot-key")
+                except:
+                    pass
+                try:
+                    driver.click("button[type='submit']")
+                    time.sleep(2)
+                except:
+                    pass
+                for sel in ["code", "input[readonly]", ".api-key"]:
+                    try:
+                        k = driver.get_text(sel).strip()
                         if k and len(k) > 10:
                             return k
+                    except:
+                        pass
+                # Fallback: get_attribute value
+                for sel in ["input[readonly]"]:
+                    try:
+                        el = driver.find_element(sel)
+                        k = el.get_attribute("value") or ""
+                        if k and len(k) > 10:
+                            return k
+                    except:
+                        pass
             except Exception as e:
                 notify_q.append(f"API key extract error: {str(e)[:100]}")
 
@@ -360,19 +529,26 @@ def _render_sync(gh_email, gh_pass, notify_q):
         notify_q.append(f"Render error: {str(e)[:150]}")
         return None
     finally:
-        try: driver.quit()
-        except: pass
+        try:
+            driver.quit()
+        except:
+            pass
 
 async def create_render(gh_email, gh_pass, bot):
     notify_q = []
     loop     = asyncio.get_event_loop()
-    future   = loop.run_in_executor(None, lambda: _render_sync(gh_email, gh_pass, notify_q))
+    future   = loop.run_in_executor(
+        None, lambda: _render_sync(gh_email, gh_pass, notify_q)
+    )
     while not future.done():
         await asyncio.sleep(2)
-        while notify_q: await safe_send(bot, notify_q.pop(0))
-    while notify_q: await safe_send(bot, notify_q.pop(0))
+        while notify_q:
+            await safe_send(bot, notify_q.pop(0))
+    while notify_q:
+        await safe_send(bot, notify_q.pop(0))
     return future.result()
 
+# ─── Full auto flow ───────────────────────────────────────────────────────────
 async def full_auto(bot):
     mail     = TempMail()
     username = rand_user()
@@ -401,7 +577,13 @@ async def full_auto(bot):
         await safe_send(bot, f"Render API key nahi mila.\nEmail: {email}\nPass: {password}")
         return
 
-    acc = {"num": len(state["accounts"]) + 1, "email": email, "username": username, "password": password, "render_api_key": rkey}
+    acc = {
+        "num": len(state["accounts"]) + 1,
+        "email": email,
+        "username": username,
+        "password": password,
+        "render_api_key": rkey,
+    }
     state["accounts"].append(acc)
     try:
         with open("accounts.json", "w") as f:
@@ -409,54 +591,81 @@ async def full_auto(bot):
     except:
         pass
 
-    await safe_send(bot, f"✅ Account #{acc['num']} READY!\n\nEmail: {email}\nGitHub: {username}\nPassword: {password}\nRender API Key: {rkey}")
+    await safe_send(
+        bot,
+        f"✅ Account #{acc['num']} READY!\n\n"
+        f"Email: {email}\nGitHub: {username}\nPassword: {password}\n"
+        f"Render API Key: {rkey}"
+    )
 
+# ─── Telegram commands ────────────────────────────────────────────────────────
 async def cmd_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if u.effective_chat.id != CHAT_ID: return
-    await u.message.reply_text("Auto Account Bot\n\n/auto - full auto\n/otp CODE - manual OTP\n/status - accounts\n/proxies - load proxies")
+    if u.effective_chat.id != CHAT_ID:
+        return
+    await u.message.reply_text(
+        "Auto Account Bot\n\n"
+        "/auto    - full auto\n"
+        "/otp CODE - manual OTP\n"
+        "/status  - accounts\n"
+        "/proxies - load proxies"
+    )
 
 async def cmd_auto(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if u.effective_chat.id != CHAT_ID: return
+    if u.effective_chat.id != CHAT_ID:
+        return
     if state["running"]:
-        await u.message.reply_text("Pehla chal raha hai..."); return
+        await u.message.reply_text("Pehla chal raha hai...")
+        return
     state["running"] = True
     await u.message.reply_text("Full auto shuru!")
     bot = ctx.bot
     async def run():
-        try:    await full_auto(bot)
-        finally: state["running"] = False
+        try:
+            await full_auto(bot)
+        finally:
+            state["running"] = False
     asyncio.create_task(run())
 
 async def cmd_otp(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if u.effective_chat.id != CHAT_ID: return
+    if u.effective_chat.id != CHAT_ID:
+        return
     if not ctx.args:
-        await u.message.reply_text("Usage: /otp CODE"); return
+        await u.message.reply_text("Usage: /otp CODE")
+        return
     state["pending_otp"] = ctx.args[0]
     await u.message.reply_text(f"OTP set: {ctx.args[0]}")
 
 async def cmd_status(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if u.effective_chat.id != CHAT_ID: return
+    if u.effective_chat.id != CHAT_ID:
+        return
     if not state["accounts"]:
         try:
-            with open("accounts.json") as f: state["accounts"] = json.load(f)
-        except: pass
+            with open("accounts.json") as f:
+                state["accounts"] = json.load(f)
+        except:
+            pass
     if not state["accounts"]:
-        await u.message.reply_text("Koi account nahi. /auto se banao."); return
+        await u.message.reply_text("Koi account nahi. /auto se banao.")
+        return
     msg = f"Total: {len(state['accounts'])}\n\n"
     for a in state["accounts"]:
         msg += f"#{a['num']} {a.get('username','?')}\n  Key: {a.get('render_api_key','?')[:20]}...\n\n"
     await u.message.reply_text(msg)
 
 async def cmd_proxies(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if u.effective_chat.id != CHAT_ID: return
+    if u.effective_chat.id != CHAT_ID:
+        return
     await u.message.reply_text("Fetch kar raha hu...")
     count = await asyncio.get_event_loop().run_in_executor(None, fetch_proxies)
     await u.message.reply_text(f"{count} proxies ready!")
 
+# ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     print(f"[*] Flask port {PORT}...")
     threading.Thread(target=run_flask, daemon=True).start()
+    threading.Thread(target=_keepalive, daemon=True).start()
     threading.Thread(target=fetch_proxies, daemon=True).start()
+
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("auto",    cmd_auto))

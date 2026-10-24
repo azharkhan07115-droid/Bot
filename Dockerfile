@@ -1,9 +1,10 @@
 FROM python:3.11-slim
 
-# chromium + chromedriver — apt se, no OOM download
+# Xvfb + Chromium + ChromeDriver
 RUN apt-get update && apt-get install -y \
     chromium \
     chromium-driver \
+    xvfb \
     fonts-liberation \
     libnss3 \
     libxss1 \
@@ -15,14 +16,17 @@ RUN apt-get update && apt-get install -y \
 
 ENV CHROME_BIN=/usr/bin/chromium
 ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
+ENV DISPLAY=:99
 
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY render_bot.py .
+COPY start.sh .
+RUN chmod +x start.sh
 
 ENV PORT=8080
 EXPOSE 8080
 
-CMD ["python", "render_bot.py"]
+CMD ["./start.sh"]
